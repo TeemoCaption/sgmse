@@ -29,7 +29,7 @@ default_init = layers.default_init
 
 
 class GaussianFourierProjection(nn.Module):
-    """給 time/noise embedding 用的 Gaussian Fourier embedding，常見於擴散模型，把 scalar timestep 嵌入為高維向量"""
+    """給 time/noise embedding 用的高斯傅立葉嵌入(Gaussian Fourier embedding)，常見於擴散模型，把 scalar timestep 嵌入為高維向量"""
 
     def __init__(self, embedding_size=256, scale=1.0):
         super().__init__()
@@ -249,7 +249,7 @@ class Downsample(nn.Module):
 
 
 class ResnetBlockDDPMpp(nn.Module):
-    """ResBlock adapted from DDPM。可用於 U-Net/擴散模型的殘差積木。"""
+    """ResBlock adapted from DDPM。可用於 U-Net/擴散模型的殘差區塊。"""
 
     def __init__(
         self,
@@ -267,9 +267,16 @@ class ResnetBlockDDPMpp(nn.Module):
         out_ch = out_ch if out_ch else in_ch
 
         # 第一個 group normalization，穩定 batch 分布
+        # GN 會把一個 batch 裡的每個樣本的特徵通道切成 num_groups 組，分組做均值與標準差歸一化，
+        # 能兼具 BatchNorm 和 LayerNorm 優點
         self.GroupNorm_0 = nn.GroupNorm(
-            num_groups=min(in_ch // 4, 32), num_channels=in_ch, eps=1e-6
+            num_groups=min(
+                in_ch // 4, 32
+            ),  # 決定分幾組，每組的 channel 數盡量約為 4，但不超過 32 組
+            num_channels=in_ch,  # 輸入的總通道數（feature map channel 數）
+            eps=1e-6,  # 很小的數字，防止分母為 0，提升數值穩定性
         )
+
         # 第一個 3x3 卷積（用於輸入轉換到 out_ch 維度）
         self.Conv_0 = conv3x3(in_ch, out_ch)
 
@@ -305,18 +312,29 @@ class ResnetBlockDDPMpp(nn.Module):
         self.conv_shortcut = conv_shortcut  # 捷徑分支是否用卷積
 
     def forward(self, x, temb=None):
+        # 先對輸入做 group normalization，再經過激活函數
         h = self.act(self.GroupNorm_0(x))
+        # 接著用 3x3 卷積做特徵轉換（可能調整 channel 數）
         h = self.Conv_0(h)
+        # 如果有提供時間步 embedding（temb），則經過 Dense_0 處理後加到特徵圖上
+        # self.act(temb)：先做激活函數；Dense_0：投影成 out_ch 維；[:, :, None, None]：擴展維度以便與 h 相加
         if temb is not None:
             h += self.Dense_0(self.act(temb))[:, :, None, None]
+        # 再做一次 group normalization 和激活函數
         h = self.act(self.GroupNorm_1(h))
+        # dropout，隨機丟棄部分神經元（防止過擬合）
         h = self.Dropout_0(h)
+        # 再經過一層 3x3 卷積
         h = self.Conv_1(h)
+        # 如果輸入 x 的通道數和目標輸出通道數不同，則對捷徑分支做 channel 對齊
         if x.shape[1] != self.out_ch:
             if self.conv_shortcut:
+                # 用 3x3 卷積做捷徑分支對齊
                 x = self.Conv_2(x)
             else:
+                # 用 NIN (1x1 conv/全連接) 做捷徑分支對齊
                 x = self.NIN_0(x)
+        # 殘差連接，可選是否 rescale（根據 skip_rescale 設定）
         if not self.skip_rescale:
             return x + h
         else:
@@ -324,79 +342,109 @@ class ResnetBlockDDPMpp(nn.Module):
 
 
 class ResnetBlockBigGANpp(nn.Module):
+    """
+    改良自 BigGAN 的 ResNet Block，可用於 U-Net/生成式模型，
+    支援 upsampling, downsampling, time embedding、FIR kernel，以及通道對齊等。
+    """
+
     def __init__(
         self,
-        act,
-        in_ch,
-        out_ch=None,
-        temb_dim=None,
-        up=False,
-        down=False,
-        dropout=0.1,
-        fir=False,
-        fir_kernel=(1, 3, 3, 1),
-        skip_rescale=True,
-        init_scale=0.0,
+        act,  # 激活函數（如 Swish、ReLU）
+        in_ch,  # 輸入通道數
+        out_ch=None,  # 輸出通道數（預設與 in_ch 相同）
+        temb_dim=None,  # 時間 embedding 維度（可選）
+        up=False,  # 是否做上採樣
+        down=False,  # 是否做下採樣
+        dropout=0.1,  # dropout 比例
+        fir=False,  # 是否用 FIR kernel 做升/降採樣
+        fir_kernel=(1, 3, 3, 1),  # FIR kernel
+        skip_rescale=True,  # 殘差是否做 rescale
+        init_scale=0.0,  # 初始化縮放因子
     ):
         super().__init__()
 
-        out_ch = out_ch if out_ch else in_ch
+        out_ch = out_ch if out_ch else in_ch  # 沒指定就用 in_ch
+        # 第一個 group normalization
         self.GroupNorm_0 = nn.GroupNorm(
             num_groups=min(in_ch // 4, 32), num_channels=in_ch, eps=1e-6
         )
+        # 記錄 up/down/fir/fir_kernel 參數
         self.up = up
         self.down = down
         self.fir = fir
         self.fir_kernel = fir_kernel
 
+        # 第一個 3x3 卷積，負責主分支特徵轉換
         self.Conv_0 = conv3x3(in_ch, out_ch)
+        # 如果指定有時間步 embedding，建立一個線性層 Dense_0
         if temb_dim is not None:
             self.Dense_0 = nn.Linear(temb_dim, out_ch)
+            # 權重用指定方式初始化
             self.Dense_0.weight.data = default_init()(self.Dense_0.weight.shape)
+            # bias 設為 0
             nn.init.zeros_(self.Dense_0.bias)
 
+        # 第二個 group normalization
         self.GroupNorm_1 = nn.GroupNorm(
             num_groups=min(out_ch // 4, 32), num_channels=out_ch, eps=1e-6
         )
+        # dropout 隨機丟棄部分神經元
         self.Dropout_0 = nn.Dropout(dropout)
+        # 第二個 3x3 卷積（主分支）
         self.Conv_1 = conv3x3(out_ch, out_ch, init_scale=init_scale)
+        # 如果 in/out 通道不同，或有 up/down（升/降採樣），則捷徑分支需加 1x1 卷積對齊
         if in_ch != out_ch or up or down:
             self.Conv_2 = conv1x1(in_ch, out_ch)
 
-        self.skip_rescale = skip_rescale
-        self.act = act
-        self.in_ch = in_ch
-        self.out_ch = out_ch
+        self.skip_rescale = skip_rescale  # 是否啟用殘差 rescale
+        self.act = act  # 激活函數
+        self.in_ch = in_ch  # 輸入通道數
+        self.out_ch = out_ch  # 輸出通道數
 
     def forward(self, x, temb=None):
+        # 先對輸入 x 做 group normalization，再經過激活函數
         h = self.act(self.GroupNorm_0(x))
 
+        # 根據設定決定是否做上採樣
         if self.up:
             if self.fir:
+                # 用高品質 FIR kernel 做上採樣（平滑+插值），h 和捷徑 x 都要上採樣
                 h = up_or_down_sampling.upsample_2d(h, self.fir_kernel, factor=2)
                 x = up_or_down_sampling.upsample_2d(x, self.fir_kernel, factor=2)
             else:
+                # 用最簡單最近鄰上採樣，h 和捷徑 x 都上採樣
                 h = up_or_down_sampling.naive_upsample_2d(h, factor=2)
                 x = up_or_down_sampling.naive_upsample_2d(x, factor=2)
+        # 如果不是 up 是 down，就做下採樣
         elif self.down:
             if self.fir:
+                # 用高品質 FIR kernel 做下採樣（濾波+取樣）
                 h = up_or_down_sampling.downsample_2d(h, self.fir_kernel, factor=2)
                 x = up_or_down_sampling.downsample_2d(x, self.fir_kernel, factor=2)
             else:
+                # 用最簡單平均池化做下採樣
                 h = up_or_down_sampling.naive_downsample_2d(h, factor=2)
                 x = up_or_down_sampling.naive_downsample_2d(x, factor=2)
 
+        # 主分支經過 3x3 卷積
         h = self.Conv_0(h)
-        # Add bias to each feature map conditioned on the time embedding
+
+        # 若有 time embedding，投影並加到主分支特徵圖上（會自動 broadcast 到空間維度）
         if temb is not None:
             h += self.Dense_0(self.act(temb))[:, :, None, None]
+
+        # 主分支再經 group normalization、激活函數
         h = self.act(self.GroupNorm_1(h))
+        # dropout 防止過擬合
         h = self.Dropout_0(h)
+        # 最後再經過一層 3x3 卷積
         h = self.Conv_1(h)
 
+        # 捷徑分支：如果 in/out channel 不同或有 up/down，則經 1x1 卷積做 channel 對齊
         if self.in_ch != self.out_ch or self.up or self.down:
             x = self.Conv_2(x)
 
+        # 殘差連接，可以選擇是否做 rescale（防止深網路梯度爆炸/消失）
         if not self.skip_rescale:
             return x + h
         else:
